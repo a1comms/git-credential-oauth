@@ -11,3 +11,5 @@ require (
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/protobuf v1.30.0 // indirect
 )
+
+replace golang.org/x/oauth2 => github.com/hickford/oauth2 v0.0.0-20230316201659-ccad9d9a87ba

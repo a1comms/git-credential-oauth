@@ -137,6 +137,8 @@ func parse(input string) map[string]string {
 
 func main() {
 	flag.BoolVar(&verbose, "verbose", false, "log debug information to stderr")
+	var device bool
+	flag.BoolVar(&device, "device", false, "instead of opening a web browser locally, print a code to enter on another device")
 	flag.Usage = func() {
 		printVersion()
 		fmt.Fprintln(os.Stderr, "usage: git credential-oauth [<options>] <action>")
@@ -238,8 +240,12 @@ func main() {
 		}
 
 		if token == nil {
-			// Generate new token (opens browser, may require user input)
-			token, err = getToken(c)
+			// Generate new token
+			if device {
+				token, err = getDeviceToken(c)
+			} else {
+				token, err = getToken(c)
+			}
 			if err != nil {
 				log.Fatalln(err)
 			}
@@ -364,6 +370,22 @@ func getToken(c oauth2.Config) (*oauth2.Token, error) {
 		}
 		return query.Get("code"), query.Get("state"), nil
 	}, generatePKCEParams()).Token()
+}
+
+func getDeviceToken(c oauth2.Config) (*oauth2.Token, error) {
+	if c.Endpoint.DeviceAuthURL == "" {
+		fmt.Fprintln(os.Stderr, "host doesn't support device auth")
+		os.Exit(0)
+	}
+	deviceAuth, err := c.DeviceAuth(context.Background())
+	if err != nil {
+		log.Fatalln(err)
+	}
+	if verbose {
+		fmt.Fprintln(os.Stderr, deviceAuth)
+	}
+	fmt.Fprintf(os.Stderr, "Please enter code %s at %s\n", deviceAuth.UserCode, deviceAuth.VerificationURI)
+	return c.Poll(context.Background(), deviceAuth)
 }
 
 func randomString(n int) string {

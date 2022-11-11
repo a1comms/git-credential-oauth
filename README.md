@@ -100,6 +100,18 @@ Edit your [global git config](https://git-scm.com/docs/git-config#FILES) `~/.git
 	helper = oauth
 ```
 
+You may use a different storage helper, but git-credential-oauth must be configured last. This ensures Git checks for *stored* credentials before generating *new* credentials.
+
+### Browserless systems
+
+On systems without a web browser, set the `-device` flag to authenticate on another device using [OAuth device flow](https://www.rfc-editor.org/rfc/rfc8628). Currently only GitHub supports this flow.
+
+```ini
+[credential]
+	helper = cache --timeout 7200	# two hours
+	helper = oauth -device
+```
+
 ### Unconfiguration
 
 Edit `~/.gitconfig` manually, or run:
