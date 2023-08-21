@@ -14,10 +14,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -28,14 +31,26 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/authhandler"
 	"golang.org/x/oauth2/endpoints"
 )
+
+const APP = "git-credential-oauth"
+
+type CredentialStorage struct {
+	Credentials  map[string]*oauth2.Token
+	LastModified time.Time
+}
+
+var credentialstore *CredentialStorage
 
 // configByHost lists default config for several public hosts.
 var configByHost = map[string]oauth2.Config{
@@ -137,8 +152,6 @@ func parse(input string) map[string]string {
 
 func main() {
 	flag.BoolVar(&verbose, "verbose", false, "log debug information to stderr")
-	var device bool
-	flag.BoolVar(&device, "device", false, "instead of opening a web browser locally, print a code to enter on another device")
 	flag.Usage = func() {
 		printVersion()
 		fmt.Fprintln(os.Stderr, "usage: git credential-oauth [<options>] <action>")
@@ -147,18 +160,29 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Actions:")
-		fmt.Fprintln(os.Stderr, "  get            Generate credential")
-		fmt.Fprintln(os.Stderr, "  configure      Configure as Git credential helper")
-		fmt.Fprintln(os.Stderr, "  unconfigure    Unconfigure as Git credential helper")
+		fmt.Fprintln(os.Stderr, "  get                    Generate credential")
+		fmt.Fprintln(os.Stderr, "  refresh bitbucket      Configure BitBucket credentials")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "See also https://github.com/hickford/git-credential-oauth")
+		fmt.Fprintln(os.Stderr, "See also https://github.com/a1comms/git-credential-oauth")
 	}
 	flag.Parse()
 	args := flag.Args()
-	if len(args) != 1 {
+	if len(args) < 1 {
 		flag.Usage()
 		os.Exit(2)
 	}
+
+	err := LoadCredentialStorage()
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		err := SaveCredentialStorage()
+		if err != nil {
+			panic(err)
+		}
+	}()
+
 	switch args[0] {
 	case "get":
 		printVersion()
@@ -228,31 +252,31 @@ func main() {
 		}
 
 		var token *oauth2.Token
-		if pairs["oauth_refresh_token"] != "" {
-			// Try refresh token (fast, doesn't open browser)
+		if tok, ok := credentialstore.Credentials[urll]; ok {
 			if verbose {
 				fmt.Fprintln(os.Stderr, "refreshing token...")
 			}
-			token, err = c.TokenSource(context.Background(), &oauth2.Token{RefreshToken: pairs["oauth_refresh_token"]}).Token()
+			token, err = oauth2.ReuseTokenSourceWithExpiry(
+				tok,
+				c.TokenSource(context.Background(), tok),
+				time.Minute*10,
+			).Token()
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "error during OAuth token refresh", err)
 			}
 		}
-
 		if token == nil {
 			// Generate new token
-			if device {
-				token, err = getDeviceToken(c)
-			} else {
-				token, err = getToken(c)
-			}
+			token, err = getToken(c)
 			if err != nil {
 				log.Fatalln(err)
 			}
 		}
+		credentialstore.Credentials[urll] = token
 		if verbose {
-			fmt.Fprintln(os.Stderr, "token:", token)
+			fmt.Fprintln(os.Stderr, "token: ", token)
 		}
+
 		var username string
 		if host == "bitbucket.org" {
 			// https://support.atlassian.com/bitbucket-cloud/docs/use-oauth-on-bitbucket-cloud/#Cloning-a-repository-with-an-access-token
@@ -269,55 +293,71 @@ func main() {
 		if username != "" {
 			output["username"] = username
 		}
-		if !token.Expiry.IsZero() {
-			output["password_expiry_utc"] = fmt.Sprintf("%d", token.Expiry.UTC().Unix())
-		}
-		if token.RefreshToken != "" {
-			output["oauth_refresh_token"] = token.RefreshToken
-		}
 		if verbose {
 			fmt.Fprintln(os.Stderr, "output:", output)
 		}
 		for key, v := range output {
 			fmt.Printf("%s=%s\n", key, v)
 		}
-	case "configure", "unconfigure":
-		gitPath, err := exec.LookPath("git")
-		if err != nil {
-			log.Fatalln(err)
+	case "refresh":
+		if len(args) != 2 {
+			flag.Usage()
+			os.Exit(2)
 		}
-		var commands []*exec.Cmd
-		if args[0] == "configure" {
-			var storage string
-			switch runtime.GOOS {
-			case "windows":
-				storage = "wincred"
-			case "darwin":
-				storage = "osxkeychain"
-			default:
-				storage = "cache --timeout 7200"
+
+		var (
+			c     oauth2.Config
+			found bool
+			urll  string
+			err   error
+		)
+
+		switch args[1] {
+		case "bitbucket":
+			c, found = configByHost["bitbucket.org"]
+			if !found {
+				fmt.Fprintln(os.Stderr, "ERROR: Configuration for BitBucket not found")
+				os.Exit(2)
 			}
-			commands = []*exec.Cmd{exec.Command(gitPath, "config", "--global", "--unset-all", "credential.helper"),
-				exec.Command(gitPath, "config", "--global", "--add", "credential.helper", storage),
-				exec.Command(gitPath, "config", "--global", "--add", "credential.helper", "oauth")}
-		} else if args[0] == "unconfigure" {
-			commands = []*exec.Cmd{exec.Command(gitPath, "config", "--global", "--unset-all", "credential.helper", "oauth")}
+			urll = "https://bitbucket.org"
+		default:
+			flag.Usage()
+			os.Exit(2)
 		}
-		for _, cmd := range commands {
-			cmd.Stderr = os.Stderr
-			cmd.Stdout = os.Stdout
+
+		var token *oauth2.Token
+		if tok, ok := credentialstore.Credentials[urll]; ok {
 			if verbose {
-				fmt.Fprintln(os.Stderr, cmd)
+				fmt.Fprintln(os.Stderr, "refreshing token...")
 			}
-			err := cmd.Run()
-			// ignore exit status 5 "you try to unset an option which does not exist" https://git-scm.com/docs/git-config#_description
-			if err != nil && cmd.ProcessState.ExitCode() != 5 {
+			token, err = oauth2.ReuseTokenSourceWithExpiry(
+				tok,
+				c.TokenSource(context.Background(), tok),
+				time.Minute*10,
+			).Token()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error during OAuth token refresh", err)
+			}
+		}
+		if token == nil {
+			// Generate new token
+			token, err = getToken(c)
+			if err != nil {
 				log.Fatalln(err)
 			}
 		}
-		fmt.Fprintf(os.Stderr, "%sd successfully\n", args[0])
+		credentialstore.Credentials[urll] = token
+		if verbose {
+			fmt.Fprintln(os.Stderr, "token: ", token)
+		}
+
+		fmt.Fprintln(os.Stderr, "Successfully refreshed token")
 	}
 }
+
+var (
+	ErrHeadless = errors.New("can't open URL, running headless")
+)
 
 func getToken(c oauth2.Config) (*oauth2.Token, error) {
 	state := randomString(16)
@@ -345,9 +385,10 @@ func getToken(c oauth2.Config) (*oauth2.Token, error) {
 		server.Start()
 	}
 	defer server.Close()
-	return authhandler.TokenSourceWithPKCE(context.Background(), &c, state, func(authCodeURL string) (code string, state string, err error) {
+
+	token, err := authhandler.TokenSourceWithPKCE(context.Background(), &c, state, func(authCodeURL string) (code string, state string, err error) {
 		defer server.Close()
-		fmt.Fprintf(os.Stderr, "Please complete authentication in your browser...\n%s\n", authCodeURL)
+
 		var open string
 		switch runtime.GOOS {
 		case "windows":
@@ -361,8 +402,12 @@ func getToken(c oauth2.Config) (*oauth2.Token, error) {
 		if _, err := exec.LookPath(open); err == nil {
 			err = exec.Command(open, authCodeURL).Run()
 			if err != nil {
-				return "", "", err
+				fmt.Fprintf(os.Stderr, "Failed to automatically open authentication URL in your browser: %s", err)
+				return "", "", ErrHeadless
 			}
+			fmt.Fprintf(os.Stderr, "Please complete authentication in your browser...\n%s\n", authCodeURL)
+		} else {
+			return "", "", ErrHeadless
 		}
 		query := <-queries
 		if verbose {
@@ -370,12 +415,57 @@ func getToken(c oauth2.Config) (*oauth2.Token, error) {
 		}
 		return query.Get("code"), query.Get("state"), nil
 	}, generatePKCEParams()).Token()
+	if err == ErrHeadless {
+		return getDeviceToken(c)
+	} else {
+		return token, err
+	}
+}
+
+type AuthResponse struct {
+	Code  string `json:"code"`
+	State string `json:"state"`
 }
 
 func getDeviceToken(c oauth2.Config) (*oauth2.Token, error) {
 	if c.Endpoint.DeviceAuthURL == "" {
-		fmt.Fprintln(os.Stderr, "host doesn't support device auth")
-		os.Exit(0)
+		if c.Endpoint.AuthURL == endpoints.Bitbucket.AuthURL {
+			stat, _ := os.Stdin.Stat()
+			if (stat.Mode() & os.ModeCharDevice) == 0 {
+				fmt.Fprintf(os.Stderr, "\nTo continue, please run the command: git credential-oauth refresh bitbucket\n\n")
+				fmt.Printf("%s=%s\n", "quit", "true")
+				os.Exit(2)
+			}
+
+			state := randomString(16)
+			c.ClientID = "Qz4LBMfmLAHGnDgNAY"
+			c.ClientSecret = "fCJ9c6FDQ8pwQrT4nShF6USjxVEzypcy"
+			c.RedirectURL = "https://git-oauth2.a1comms.net/bitbucket/"
+			return authhandler.TokenSourceWithPKCE(context.Background(), &c, state, func(authCodeURL string) (code string, state string, err error) {
+				fmt.Fprintf(os.Stderr, "Please complete authentication in your browser...\n%s\n\n", authCodeURL)
+
+				fmt.Fprintf(os.Stderr, "Paste your response token here: ")
+				input := bufio.NewScanner(os.Stdin)
+				input.Scan()
+
+				authResponseToken, err := base64.StdEncoding.DecodeString(input.Text())
+				if err != nil {
+					return "", "", err
+				}
+
+				authResponse := &AuthResponse{}
+
+				err = json.Unmarshal(authResponseToken, authResponse)
+				if err != nil {
+					return "", "", err
+				}
+
+				return authResponse.Code, authResponse.State, nil
+			}, generatePKCEParams()).Token()
+		} else {
+			fmt.Fprintln(os.Stderr, "host doesn't support device auth")
+			os.Exit(0)
+		}
 	}
 	deviceAuth, err := c.DeviceAuth(context.Background())
 	if err != nil {
@@ -385,7 +475,7 @@ func getDeviceToken(c oauth2.Config) (*oauth2.Token, error) {
 		fmt.Fprintln(os.Stderr, deviceAuth)
 	}
 	fmt.Fprintf(os.Stderr, "Please enter code %s at %s\n", deviceAuth.UserCode, deviceAuth.VerificationURI)
-	return c.Poll(context.Background(), deviceAuth)
+	return c.DeviceAccessToken(context.Background(), deviceAuth)
 }
 
 func randomString(n int) string {
@@ -428,4 +518,83 @@ func urlResolveReference(base, ref string) (string, error) {
 		return "", err
 	}
 	return base1.ResolveReference(ref1).String(), nil
+}
+
+func LoadCredentialStorage() error {
+	file, err := GetCredentialStorageFile()
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	dec := json.NewDecoder(file)
+
+	err = dec.Decode(&credentialstore)
+	if err == io.EOF {
+		credentialstore = &CredentialStorage{
+			Credentials: make(map[string]*oauth2.Token),
+		}
+		return nil
+	}
+	return err
+}
+
+func SaveCredentialStorage() error {
+	file, err := GetCredentialStorageFile()
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "    ")
+
+	credentialstore.LastModified = time.Now()
+
+	return enc.Encode(credentialstore)
+}
+
+func GetCredentialStorageFile() (*os.File, error) {
+	location := GetRuntimeSpecificConfigDirectory()
+
+	if _, err := os.Stat(location); os.IsNotExist(err) {
+		if err = os.MkdirAll(location, 0700); err != nil {
+			return nil, err
+		}
+	}
+
+	location = filepath.Join(location, "credentials.json")
+
+	return os.OpenFile(location, os.O_RDWR|os.O_CREATE, 0600)
+}
+
+func GetRuntimeSpecificConfigDirectory() string {
+	var homeDir string
+	usr, err := user.Current()
+	if err == nil {
+		homeDir = usr.HomeDir
+	}
+
+	// Fall back to standard HOME environment variable that works
+	// for most POSIX OSes if the directory from the Go standard
+	// lib failed.
+	if err != nil || homeDir == "" {
+		homeDir = os.Getenv("HOME")
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(GetEnvAsString("LOCALAPPDATA", os.Getenv("APPDATA")), APP)
+	case "darwin":
+		return filepath.Join(homeDir, "Library", "Application Support", APP)
+	default:
+		return filepath.Join(GetEnvAsString("XDG_DATA_HOME", filepath.Join(GetEnvAsString("HOME", "."), ".local", "share")), APP)
+	}
+}
+
+func GetEnvAsString(name, fallback string) string {
+	if value, ok := os.LookupEnv(name); ok && len(value) > 0 {
+		return value
+	}
+	return fallback
 }
