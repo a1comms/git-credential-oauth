@@ -54,17 +54,18 @@ var credentialstore *CredentialStorage
 
 // configByHost lists default config for several public hosts.
 var configByHost = map[string]oauth2.Config{
-	// https://github.com/settings/applications/2017944
+	// https://github.com/organizations/a1comms/settings/apps/git-credentials-oauth
 	"github.com": {
-		ClientID: "b895675a4e2cf54d5c6c",
+		ClientID: "Iv1.667f659032baad48",
 		// IMPORTANT: The client "secret" below is non confidential.
 		// This is expected for OAuth native apps which (unlike web apps) are public clients
 		// "incapable of maintaining the confidentiality of their credentials"
 		// "It is assumed that any client authentication credentials included in the application can be extracted"
 		// https://datatracker.ietf.org/doc/html/rfc6749#section-2.1
-		ClientSecret: "2b746eea028711749c5062b9fe626fed78d03cc0",
+		ClientSecret: "836d11be22dcaf39574fd7ee5009e4d0f1c972e7",
 		Endpoint:     endpoints.GitHub,
-		Scopes:       []string{"repo", "gist", "workflow"}},
+		Scopes:       []string{},
+	},
 	// https://gitlab.com/oauth/applications/232663
 	"gitlab.com": {
 		ClientID: "10bfbbf46e5b760b55ce772a262d7a0205eacc417816eb84d37d0fb02c89bb97",
@@ -111,8 +112,8 @@ var configByHost = map[string]oauth2.Config{
 		Endpoint:     oauth2.Endpoint{AuthURL: "https://codeberg.org/login/oauth/authorize", TokenURL: "https://codeberg.org/login/oauth/access_token"}},
 	// https://bitbucket.org/hickford/workspace/settings/oauth-consumers/983448/edit
 	"bitbucket.org": {
-		ClientID:     "abET6ywGmTknNRvAMT",
-		ClientSecret: "df8rsnkAxuHCgZrSgu5ykJQjrbGVzT9m",
+		ClientID:     "UMfcbYmgnHRcW2M4ag",
+		ClientSecret: "cpc2wSgQSqBW7jUAddEcjqyXxzAgZDfe",
 		Endpoint:     endpoints.Bitbucket,
 		Scopes:       []string{"repository", "repository:write"}},
 	"android.googlesource.com": {
@@ -195,6 +196,9 @@ func main() {
 			fmt.Fprintln(os.Stderr, "input:", pairs)
 		}
 		host := pairs["host"]
+		if host == "gist.github.com" {
+			host = "github.com"
+		}
 		looksLikeGitLab := strings.HasPrefix(host, "gitlab.") || strings.Contains(pairs["wwwauth[]"], `Realm="GitLab"`)
 		urll := fmt.Sprintf("%s://%s", pairs["protocol"], host)
 		c, found := configByHost[host]
@@ -246,9 +250,13 @@ func main() {
 		}
 		if c.ClientID == "" || c.Endpoint.AuthURL == "" || c.Endpoint.TokenURL == "" {
 			if looksLikeGitLab {
-				fmt.Fprintf(os.Stderr, "It looks like you're authenticating to a GitLab instance! To configure git-credential-oauth for host %s, follow the instructions at https://github.com/hickford/git-credential-oauth/issues/18. You may need to register an OAuth application at https://%s/-/profile/applications\n", host, host)
+				fmt.Fprintf(os.Stderr, "\nIt looks like you're authenticating to a GitLab instance! To configure git-credential-oauth for host %s, follow the instructions at https://github.com/hickford/git-credential-oauth/issues/18. You may need to register an OAuth application at https://%s/-/profile/applications\n", host, host)
 			}
 			return
+		}
+
+		if host == "github.com" {
+			fmt.Fprintf(os.Stderr, "\nUsing GitHub App authentication - if you get a 403, install the app by visiting:\n\nhttps://github.com/apps/git-credentials-oauth/installations/new\n\n")
 		}
 
 		var token *oauth2.Token
@@ -262,14 +270,18 @@ func main() {
 				time.Minute*10,
 			).Token()
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "error during OAuth token refresh", err)
+				fmt.Fprintln(os.Stderr, "\nerror during OAuth token refresh\n", err)
+				fmt.Printf("%s=%s\n", "quit", "true")
+				os.Exit(2)
 			}
 		}
 		if token == nil {
 			// Generate new token
 			token, err = getToken(c)
 			if err != nil {
-				log.Fatalln(err)
+				fmt.Fprintln(os.Stderr, "\nERROR: %s\n", err)
+				fmt.Printf("%s=%s\n", "quit", "true")
+				os.Exit(2)
 			}
 		}
 		credentialstore.Credentials[urll] = token
@@ -336,7 +348,7 @@ func main() {
 				time.Minute*10,
 			).Token()
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "error during OAuth token refresh", err)
+				fmt.Fprintln(os.Stderr, "error during OAuth token refresh\n", err)
 			}
 		}
 		if token == nil {
@@ -402,10 +414,10 @@ func getToken(c oauth2.Config) (*oauth2.Token, error) {
 		if _, err := exec.LookPath(open); err == nil {
 			err = exec.Command(open, authCodeURL).Run()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to automatically open authentication URL in your browser: %s", err)
+				fmt.Fprintf(os.Stderr, "\nFailed to automatically open authentication URL in your browser: %s\n", err)
 				return "", "", ErrHeadless
 			}
-			fmt.Fprintf(os.Stderr, "Please complete authentication in your browser...\n%s\n", authCodeURL)
+			fmt.Fprintf(os.Stderr, "\nPlease complete authentication in your browser...\n\n%s\n", authCodeURL)
 		} else {
 			return "", "", ErrHeadless
 		}
@@ -442,7 +454,7 @@ func getDeviceToken(c oauth2.Config) (*oauth2.Token, error) {
 			c.ClientSecret = "fCJ9c6FDQ8pwQrT4nShF6USjxVEzypcy"
 			c.RedirectURL = "https://git-oauth2.a1comms.net/bitbucket/"
 			return authhandler.TokenSourceWithPKCE(context.Background(), &c, state, func(authCodeURL string) (code string, state string, err error) {
-				fmt.Fprintf(os.Stderr, "Please complete authentication in your browser...\n%s\n\n", authCodeURL)
+				fmt.Fprintf(os.Stderr, "Please complete authentication in your browser...\n\n%s\n\n", authCodeURL)
 
 				fmt.Fprintf(os.Stderr, "Paste your response token here: ")
 				input := bufio.NewScanner(os.Stdin)
