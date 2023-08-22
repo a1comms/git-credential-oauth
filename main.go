@@ -110,10 +110,17 @@ var configByHost = map[string]oauth2.Config{
 		ClientID:     "246ca3e8-e974-430c-b9ec-3d4e2b54ad28",
 		ClientSecret: "gto_4stsgpwkgtsvayljdsg3xq33l2v3v245rlc45tnpt4cjp7eyw5gq",
 		Endpoint:     oauth2.Endpoint{AuthURL: "https://codeberg.org/login/oauth/authorize", TokenURL: "https://codeberg.org/login/oauth/access_token"}},
-	// https://bitbucket.org/hickford/workspace/settings/oauth-consumers/983448/edit
+	// https://bitbucket.org/a1commsltd/workspace/settings/oauth-consumers/1013298/edit
 	"bitbucket.org": {
 		ClientID:     "UMfcbYmgnHRcW2M4ag",
 		ClientSecret: "cpc2wSgQSqBW7jUAddEcjqyXxzAgZDfe",
+		Endpoint:     endpoints.Bitbucket,
+		Scopes:       []string{"repository", "repository:write"}},
+	// https://bitbucket.org/a1commsltd/workspace/settings/oauth-consumers/1012852/edit
+	"bitbucket.org-headless": {
+		ClientID:     "Qz4LBMfmLAHGnDgNAY",
+		ClientSecret: "fCJ9c6FDQ8pwQrT4nShF6USjxVEzypcy",
+		RedirectURL:  "https://git-oauth2.a1comms.net/bitbucket/",
 		Endpoint:     endpoints.Bitbucket,
 		Scopes:       []string{"repository", "repository:write"}},
 	"android.googlesource.com": {
@@ -259,34 +266,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "\nUsing GitHub App authentication - if you get a 403, install the app by visiting:\n\nhttps://github.com/apps/git-credentials-oauth/installations/new\n\n")
 		}
 
-		var token *oauth2.Token
-		if tok, ok := credentialstore.Credentials[urll]; ok {
-			if verbose {
-				fmt.Fprintln(os.Stderr, "refreshing token...")
-			}
-			token, err = oauth2.ReuseTokenSourceWithExpiry(
-				tok,
-				c.TokenSource(context.Background(), tok),
-				time.Minute*10,
-			).Token()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "\nerror during OAuth token refresh\n", err)
-				fmt.Printf("%s=%s\n", "quit", "true")
-				os.Exit(2)
-			}
-		}
-		if token == nil {
-			// Generate new token
-			token, err = getToken(c)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "\nERROR: %s\n", err)
-				fmt.Printf("%s=%s\n", "quit", "true")
-				os.Exit(2)
-			}
-		}
-		credentialstore.Credentials[urll] = token
-		if verbose {
-			fmt.Fprintln(os.Stderr, "token: ", token)
+		token, err := fetchToken(host, urll, c)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "\nERROR: %s\n", err)
+			fmt.Printf("%s=%s\n", "quit", "true")
+			os.Exit(2)
 		}
 
 		var username string
@@ -320,6 +304,7 @@ func main() {
 		var (
 			c     oauth2.Config
 			found bool
+			host  string
 			urll  string
 			err   error
 		)
@@ -331,36 +316,16 @@ func main() {
 				fmt.Fprintln(os.Stderr, "ERROR: Configuration for BitBucket not found")
 				os.Exit(2)
 			}
-			urll = "https://bitbucket.org"
+			host, urll = "bitbucket.org", "https://bitbucket.org"
 		default:
 			flag.Usage()
 			os.Exit(2)
 		}
 
-		var token *oauth2.Token
-		if tok, ok := credentialstore.Credentials[urll]; ok {
-			if verbose {
-				fmt.Fprintln(os.Stderr, "refreshing token...")
-			}
-			token, err = oauth2.ReuseTokenSourceWithExpiry(
-				tok,
-				c.TokenSource(context.Background(), tok),
-				time.Minute*10,
-			).Token()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error during OAuth token refresh\n", err)
-			}
-		}
-		if token == nil {
-			// Generate new token
-			token, err = getToken(c)
-			if err != nil {
-				log.Fatalln(err)
-			}
-		}
-		credentialstore.Credentials[urll] = token
-		if verbose {
-			fmt.Fprintln(os.Stderr, "token: ", token)
+		_, err = fetchToken(host, urll, c)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "\nERROR: %s\n", err)
+			os.Exit(2)
 		}
 
 		fmt.Fprintln(os.Stderr, "Successfully refreshed token")
@@ -450,9 +415,11 @@ func getDeviceToken(c oauth2.Config) (*oauth2.Token, error) {
 			}
 
 			state := randomString(16)
-			c.ClientID = "Qz4LBMfmLAHGnDgNAY"
-			c.ClientSecret = "fCJ9c6FDQ8pwQrT4nShF6USjxVEzypcy"
-			c.RedirectURL = "https://git-oauth2.a1comms.net/bitbucket/"
+			var found bool
+			c, found = configByHost["bitbucket.org-headless"]
+			if !found {
+				return nil, fmt.Errorf("Configuration for BitBucket not found")
+			}
 			return authhandler.TokenSourceWithPKCE(context.Background(), &c, state, func(authCodeURL string) (code string, state string, err error) {
 				fmt.Fprintf(os.Stderr, "Please complete authentication in your browser...\n\n%s\n\n", authCodeURL)
 
@@ -488,6 +455,59 @@ func getDeviceToken(c oauth2.Config) (*oauth2.Token, error) {
 	}
 	fmt.Fprintf(os.Stderr, "Please enter code %s at %s\n", deviceAuth.UserCode, deviceAuth.VerificationURI)
 	return c.DeviceAccessToken(context.Background(), deviceAuth)
+}
+
+func fetchToken(host, urll string, c oauth2.Config) (*oauth2.Token, error) {
+	var (
+		err   error
+		token *oauth2.Token
+	)
+
+	if tok, ok := credentialstore.Credentials[urll]; ok {
+		if verbose {
+			fmt.Fprintln(os.Stderr, "refreshing token...")
+		}
+		token, err = oauth2.ReuseTokenSourceWithExpiry(
+			tok,
+			c.TokenSource(context.Background(), tok),
+			time.Minute*10,
+		).Token()
+		if err != nil {
+			if host == "bitbucket.org" {
+				var found bool
+
+				c, found = configByHost["bitbucket.org-headless"]
+				if !found {
+					return nil, fmt.Errorf("Configuration for BitBucket not found")
+				}
+
+				token, err = oauth2.ReuseTokenSourceWithExpiry(
+					tok,
+					c.TokenSource(context.Background(), tok),
+					time.Minute*10,
+				).Token()
+			}
+			if err != nil {
+				fmt.Errorf("error during OAuth token refresh: %s", err)
+			}
+		}
+	}
+
+	if token == nil {
+		// Generate new token
+		token, err = getToken(c)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if verbose {
+		fmt.Fprintln(os.Stderr, "token: ", token)
+	}
+
+	credentialstore.Credentials[urll] = token
+
+	return token, nil
 }
 
 func randomString(n int) string {
